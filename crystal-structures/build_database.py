@@ -9,6 +9,11 @@
 # training dataset: CATH families for proteins: recreate with just crystal proteins
 # filter for redundancy in dataset
 
+# create a new folder for each structure
+# store each generated ASU as its own file
+# 3. maybe write to file in folder
+# 2. find all residues within 15A
+
 import os
 import requests
 import gemmi
@@ -94,98 +99,109 @@ def generate_first_contact_shell(
     output_path: str,
     cutoff_distance: float = 4.5,
 ) -> str:
-    """Computes and saves the central ASU surrounded by its first crystal contact shell."""
-    structure = gemmi.read_structure(input_path)
-    cell = structure.cell
-    sg = structure.find_spacegroup()
-    if not sg:
-        raise ValueError("Structure lacks space group or unit cell parameters.")
 
-    # Strip waters and hydrogens so contacts represent direct protein-protein packing
-    structure.remove_waters()
-    structure.remove_hydrogens()
+    st = gemmi.read_structure(input_path)
+    st.remove_waters()
+    st.remove_hydrogens()
 
-    # Index ASU atoms into a periodic spatial grid
-    ns = gemmi.NeighborSearch(structure[0], cell, max_radius=cutoff_distance)
-    ns.populate(include_h=False)
+    model = st[0]
+    cell = st.cell
 
-    # Search through space group operations and direct neighboring unit cells (-1, 0, 1)
-    identity_op = gemmi.Op("x,y,z")
-    contact_transforms = []
+    ns = gemmi.NeighborSearch(
+        model,
+        cell,
+        cutoff_distance,
+    ).populate(include_h=False)
 
-    for sym_op in sg.operations():
-        for ta in (-1, 0, 1):
-            for tb in (-1, 0, 1):
-                for tc in (-1, 0, 1):
-                    # Skip identity at reference unit cell [0, 0, 0]
-                    if sym_op == identity_op and ta == 0 and tb == 0 and tc == 0:
+    # Store unique symmetry images as:
+    # (symmetry operation, PBC translation)
+    images = set()
+
+    for chain in model:
+        for residue in chain:
+            for atom in residue:
+
+                for mark in ns.find_neighbors(
+                    atom,
+                    min_dist=0.1,
+                    max_dist=cutoff_distance,
+                ):
+
+                    # Original atom corresponding to this Mark
+                    original_atom = mark.to_cra(model).atom
+
+                    # Find the actual PBC image of the symmetry-related
+                    # atom that is near our central atom.
+                    nearest = cell.find_nearest_pbc_image(
+                        atom.pos,
+                        original_atom.pos,
+                        mark.image_idx,
+                    )
+
+                    # PBC translation
+                    shift = (
+                        nearest.pbc_shift[0],
+                        nearest.pbc_shift[1],
+                        nearest.pbc_shift[2],
+                    )
+
+                    key = (mark.image_idx, shift)
+
+                    # Don't include the central ASU itself.
+                    if mark.image_idx == 0 and shift == (0, 0, 0):
                         continue
 
-                    # Check if any atom in this symmetry mate touches the reference ASU
-                    has_contact = False
-                    for chain in structure[0]:
-                        if has_contact:
-                            break
-                        for res in chain:
-                            if has_contact:
-                                break
-                            for atom in res:
-                                # Transform Cartesian -> Fractional
-                                frac = cell.fractionalize(atom.pos)
-                                # Apply rotational/screw symmetry operation
-                                sym_frac = sym_op.apply_to_xyz([frac.x, frac.y, frac.z])
-                                # Add unit cell translation directly
-                                final_frac = gemmi.Fractional(
-                                    sym_frac[0] + ta,
-                                    sym_frac[1] + tb,
-                                    sym_frac[2] + tc,
-                                )
-                                sym_pos = cell.orthogonalize(final_frac)
+                    images.add(key)
 
-                                # Keyword-only argument: radius=cutoff_distance
-                                if len(ns.find_atoms(sym_pos, radius=cutoff_distance)) > 0:
-                                    contact_transforms.append((sym_op, (ta, tb, tc)))
-                                    has_contact = True
-                                    break
+    # Create output structure.
+    out = gemmi.Structure()
+    out.cell = cell
+    out.spacegroup_hm = st.spacegroup_hm
 
-    # Build the assembled contact shell
-    shell_struct = gemmi.Structure()
-    shell_struct.cell = cell
-    shell_struct.spacegroup_hm = structure.spacegroup_hm
-    shell_model = gemmi.Model("1")
+    out.add_model(gemmi.Model("1"))
+    out_model = out[0]
 
-    # Add reference ASU chains
-    for chain in structure[0]:
-        ref_chain = chain.clone()
-        ref_chain.name = f"{chain.name}_ref"
-        shell_model.add_chain(ref_chain)
 
-    # Add interacting symmetry mates with unique chain identifiers
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-    chain_counter = 0
+    # Add central ASU.
+    for chain in model:
+        out_model.add_chain(chain.clone())
 
-    for sym_op, (ta, tb, tc) in contact_transforms:
-        for chain in structure[0]:
-            sym_chain = chain.clone()
-            suffix = chain_counter // len(alphabet)
-            sym_chain.name = f"{alphabet[chain_counter % len(alphabet)]}{suffix if suffix > 0 else ''}"
-            chain_counter += 1
+    # Add each contacting symmetry-related ASU.
+    for image_idx, shift in images:
 
-            for res in sym_chain:
-                for atom in res:
-                    frac = cell.fractionalize(atom.pos)
-                    sym_frac = sym_op.apply_to_xyz([frac.x, frac.y, frac.z])
-                    final_frac = gemmi.Fractional(
-                        sym_frac[0] + ta,
-                        sym_frac[1] + tb,
-                        sym_frac[2] + tc,
+        transform = ns.get_image_transformation(image_idx)
+
+        for chain in model:
+
+            new_chain = out_model.add_chain(
+                chain,
+                unique_name=True,
+            )
+
+            for residue in new_chain:
+                for atom in residue:
+
+                    frac = transform.apply(
+                        cell.fractionalize(atom.pos)
                     )
-                    atom.pos = cell.orthogonalize(final_frac)
 
-            shell_model.add_chain(sym_chain)
+                    frac = gemmi.Fractional(
+                        frac.x + shift[0],
+                        frac.y + shift[1],
+                        frac.z + shift[2],
+                    )
 
-    shell_struct.add_model(shell_model)
-    shell_struct.make_mmcif_document().write_file(output_path)
+                    atom.pos = cell.orthogonalize(frac)
+
+    out.assign_serial_numbers(numbered_ter=False)
+    out.make_mmcif_document().write_file(output_path)
+
+    print(f"Cutoff: {cutoff_distance}")
+    print(f"Number of contacting ASUs: {len(images)}")
+
+    for image_idx, shift in sorted(images):
+        print(image_idx, shift)
+    
     return output_path
 
 
@@ -210,7 +226,7 @@ def process_unprocessed_structures(target_new_count: int = 5, page_size: int = 5
             try:
                 raw_file = download_cif(pdb_id)
                 output_file = os.path.join(SHELL_DIR, f"{pdb_id}_shell.cif")
-                generate_first_contact_shell(raw_file, output_file, cutoff_distance=4.5)
+                generate_first_contact_shell(raw_file, output_file, cutoff_distance=15)
 
                 print(f"[{newly_processed + 1}] Successfully generated shell for {pdb_id}")
                 processed_ids.add(pdb_id)
@@ -228,4 +244,4 @@ def process_unprocessed_structures(target_new_count: int = 5, page_size: int = 5
 
 if __name__ == "__main__":
     # Processes 5 new entries per run; set target_new_count=None to run without an upper bound
-    process_unprocessed_structures(target_new_count=5)
+    process_unprocessed_structures(target_new_count=10)
